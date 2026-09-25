@@ -1,0 +1,39 @@
+# Datasets and raw files
+**/dataset/
+*.csv
+*.tsv
+
+# Cache and precomputed artifacts
+**/cache/
+*.parquet
+*.feather
+
+# Model weights and predictions
+**/output/
+*.pkl
+*.pickle
+*.joblib
+*.bin
+*.model
+
+# Python & environment files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+models/
+*.log
