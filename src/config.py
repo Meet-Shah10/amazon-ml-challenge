@@ -11,14 +11,29 @@ import os
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))          # src/
 PROJECT_DIR = os.path.dirname(SRC_DIR)                        # business_entity_resolution/
 CODE_DIR = os.path.dirname(PROJECT_DIR)                       # code/
-RESOURCE_ROOT = os.path.dirname(CODE_DIR)                     # student_resource/
+RESOURCE_ROOT = os.environ.get("RESOURCE_ROOT", os.path.dirname(CODE_DIR))                     # student_resource/
 
-DATA_DIR = os.path.join(RESOURCE_ROOT, "dataset")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(RESOURCE_ROOT, "dataset"))
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 TEST_DIR = os.path.join(DATA_DIR, "test")
-OUTPUT_DIR = os.path.join(RESOURCE_ROOT, "output")
-CACHE_DIR = os.path.join(PROJECT_DIR, "cache")
-MODEL_DIR = os.path.join(PROJECT_DIR, "models")
+
+# Auto-detect dataset directory on Kaggle if default DATA_DIR does not exist
+if not os.path.exists(DATA_DIR) and os.path.exists("/kaggle/input"):
+    for root, dirs, files in os.walk("/kaggle/input"):
+        if "train_source1.tsv" in files:
+            TRAIN_DIR = root
+            DATA_DIR = os.path.dirname(root)
+            TEST_DIR = os.path.join(DATA_DIR, "test")
+            break
+        elif "train" in dirs and os.path.exists(os.path.join(root, "train", "train_source1.tsv")):
+            DATA_DIR = root
+            TRAIN_DIR = os.path.join(DATA_DIR, "train")
+            TEST_DIR = os.path.join(DATA_DIR, "test")
+            break
+
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", os.path.join(RESOURCE_ROOT, "output") if os.path.exists(RESOURCE_ROOT) else os.path.join(PROJECT_DIR, "output"))
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(PROJECT_DIR, "cache"))
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(PROJECT_DIR, "models"))
 
 # Source file paths
 TRAIN_S1 = os.path.join(TRAIN_DIR, "train_source1.tsv")
@@ -42,13 +57,18 @@ PRUNE_TOP_K = 20             # hard top-K per S1 entity after union
 PRUNE_MIN_SCORE = 0.35       # score-floor exception for high-confidence extras
 PRUNE_HARD_CAP = 60          # absolute cap even with score-floor exception
 
-# TF-IDF vectoriser (memory-safe defaults for 8 GB machines; raise
-# TFIDF_MAX_FEATURES to 100_000-200_000 if you have ≥ 16 GB RAM)
+# TF-IDF vectoriser
+# TFIDF_MAX_FEATURES:  35_000 is the Kaggle-safe default (30 GB RAM limit).
+#   Raise to 50_000-100_000 if you have ≥ 16 GB free RAM.
+# TFIDF_BATCH_SIZE:   100 keeps the per-batch intermediate dense matrix
+#   at ~800 MB even for the largest partition (India: 4.1 M candidates).
+#   The previous default of 1000 caused an ~8 GB spike and OOM kill on Kaggle.
+#   Raise back to 1000 only on machines with ≥ 64 GB RAM.
 TFIDF_NGRAM_RANGE = (2, 4)
 TFIDF_MIN_DF = 3             # prune rare n-grams (typo singletons)
 TFIDF_MAX_DF = 0.5
-TFIDF_MAX_FEATURES = 50_000  # caps vocabulary → bounds sparse matrix size
-TFIDF_BATCH_SIZE = 1000      # S1-entity batch size for sparse matmul
+TFIDF_MAX_FEATURES = 35_000  # caps vocabulary → bounds sparse matrix size
+TFIDF_BATCH_SIZE = 100       # S1-entity batch size for sparse matmul (Kaggle-safe)
 TFIDF_SIM_THRESHOLD = 0.1    # drop cosine similarities below this
 
 # LightGBM
