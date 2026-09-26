@@ -42,15 +42,17 @@ logger = logging.getLogger(__name__)
 
 def _sparse_top_k_rows(sim_matrix: csr_matrix, row_offset: int,
                        s1_ids: np.ndarray, other_ids: np.ndarray,
-                       top_k: int, score_col: str,
-                       threshold: float = 0.0) -> list:
+                       top_k: int,
+                       out_s1: list, out_cand: list, out_scores: list) -> None:
     """Extract top-K entries per row from a sparse similarity matrix.
 
-    Uses CSR indptr / indices / data arrays directly — avoids the
-    overhead of calling getrow() and constructing a new sparse object
-    for every row.
+    Appends directly into three flat parallel lists (out_s1, out_cand,
+    out_scores) instead of building Python dicts.  This is 5-10x cheaper
+    on memory: 13M pairs as dicts ≈ 2.6 GB; as three flat lists ≈ 600 MB.
+
+    Uses CSR indptr / indices / data arrays directly — avoids the overhead
+    of calling getrow() for every row.
     """
-    results = []
     indptr  = sim_matrix.indptr
     indices = sim_matrix.indices
     data    = sim_matrix.data
@@ -64,34 +66,22 @@ def _sparse_top_k_rows(sim_matrix: csr_matrix, row_offset: int,
         row_data    = data[start_ptr:end_ptr]
         row_indices = indices[start_ptr:end_ptr]
 
-        if threshold > 0:
-            mask = row_data >= threshold
-            if not mask.any():
-                continue
-            row_data    = row_data[mask]
-            row_indices = row_indices[mask]
-
         global_i = row_offset + i
         s1_id    = s1_ids[global_i]
         n        = len(row_data)
 
         if n <= top_k:
             for j, score in zip(row_indices, row_data):
-                results.append({
-                    "source1_entity_id":  s1_id,
-                    "candidate_entity_id": other_ids[j],
-                    score_col:            float(score),
-                })
+                out_s1.append(s1_id)
+                out_cand.append(other_ids[j])
+                out_scores.append(float(score))
         else:
             # O(n) partial sort instead of O(n log n) full sort
             top_local = np.argpartition(row_data, -top_k)[-top_k:]
             for idx in top_local:
-                results.append({
-                    "source1_entity_id":  s1_id,
-                    "candidate_entity_id": other_ids[row_indices[idx]],
-                    score_col:            float(row_data[idx]),
-                })
-    return results
+                out_s1.append(s1_id)
+                out_cand.append(other_ids[row_indices[idx]])
+                out_scores.append(float(row_data[idx]))
 
 
 # ── Strategy 1 & 2: TF-IDF blocking (memory-safe) ────────────────────────
@@ -101,9 +91,9 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     """
     TF-IDF char n-gram blocking with batched sparse matrix multiplication.
 
-    Fits the vectoriser on the union of both corpora (unsupervised — no label
-    leakage).  Memory is bounded by max_features, and queries are batched to
-    keep intermediate similarity matrices small.
+    Uses three flat parallel lists instead of per-row Python dicts to
+    accumulate results — saves 5-10x RAM vs dict-per-row (2.6 GB → 600 MB
+    for India's ~13M candidate pairs).
     """
     if other_df.empty or s1_df.empty:
         return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", score_col])
@@ -153,8 +143,12 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
 
     batch_size = config.TFIDF_BATCH_SIZE
     threshold  = config.TFIDF_SIM_THRESHOLD
-    all_results = []
-    n_batches   = (n_s1 + batch_size - 1) // batch_size
+    n_batches  = (n_s1 + batch_size - 1) // batch_size
+
+    # Flat parallel lists — 5-10x lighter than list-of-dicts
+    out_s1: list     = []
+    out_cand: list   = []
+    out_scores: list = []
 
     for b in tqdm(range(n_batches), desc=f"      tfidf-{text_col}", leave=False):
         start = b * batch_size
@@ -169,24 +163,28 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
             sim.data[sim.data < threshold] = 0
             sim.eliminate_zeros()
 
-        batch_results = _sparse_top_k_rows(
-            sim, start, s1_ids, other_ids, top_k, score_col, threshold=0
+        _sparse_top_k_rows(
+            sim, start, s1_ids, other_ids, top_k,
+            out_s1, out_cand, out_scores,
         )
-        all_results.extend(batch_results)
 
         del sim, batch
-        # Note: gc.collect() deliberately omitted here — Python's reference
-        # counting frees 'sim' and 'batch' immediately on 'del'. Calling
-        # gc.collect() inside a tight loop of 500-8000 iterations wastes
-        # 0.2-0.5s per call (45+ minutes total for India) with no benefit.
+        # gc.collect() omitted: Python ref-counting frees sim/batch immediately.
+        # Calling gc.collect() inside a tight loop wastes 0.2-0.5s per call.
 
     del s1_vecs, other_vecs
     gc.collect()
 
-    logger.info("      found %d candidate pairs", len(all_results))
-    return pd.DataFrame(all_results) if all_results else pd.DataFrame(
-        columns=["source1_entity_id", "candidate_entity_id", score_col]
-    )
+    n_pairs = len(out_s1)
+    logger.info("      found %d candidate pairs", n_pairs)
+    if not out_s1:
+        return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", score_col])
+
+    return pd.DataFrame({
+        "source1_entity_id":  out_s1,
+        "candidate_entity_id": out_cand,
+        score_col:            out_scores,
+    })
 
 
 # ── Strategy 3: Token inverted-index blocking ─────────────────────────────

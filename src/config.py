@@ -47,32 +47,29 @@ TEST_S3 = os.path.join(TEST_DIR, "test_source3.tsv")
 # ── Tunable parameters ────────────────────────────────────────────────────
 
 # Blocking
-TFIDF_TOP_K = 25             # neighbours per S1 entity from TF-IDF NN
-TOKEN_BLOCK_MAX_DF = 5000    # inverted-index: skip tokens in >N docs
+TFIDF_TOP_K = 10             # neighbours per S1 entity from TF-IDF NN
+TOKEN_BLOCK_MAX_DF = 3000    # inverted-index: skip tokens in >N docs
 TOKEN_BLOCK_MIN_SHARED = 2   # min shared tokens to keep a candidate
 ADDR_ANCHOR_ENABLED = True   # address-anchor blocking on/off
 
 # Pruning
-PRUNE_TOP_K = 20             # hard top-K per S1 entity after union
-PRUNE_MIN_SCORE = 0.35       # score-floor exception for high-confidence extras
-PRUNE_HARD_CAP = 60          # absolute cap even with score-floor exception
+PRUNE_TOP_K = 12             # hard top-K per S1 entity after union
+PRUNE_MIN_SCORE = 0.40       # score-floor exception for high-confidence extras
+PRUNE_HARD_CAP = 25          # absolute cap even with score-floor exception
 
 # TF-IDF vectoriser
-# TFIDF_NGRAM_RANGE: (3,5) uses discriminative 3-grams instead of noisy 2-grams.
-#   2-grams like "in","st","co" appear in almost every business name, creating
-#   a dense similarity matrix that makes every S1 query match millions of docs.
-#   3-grams "sta","tar","buc" are truly sparse → allows a much larger batch size.
-# TFIDF_MAX_FEATURES: 30_000 is the Kaggle-safe default (30 GB RAM).
-# TFIDF_BATCH_SIZE:   1500 is safe with 3-grams (sparse matrix, ~800 MB peak).
-#   The previous batch size of 100 with 2-grams caused 8,832 batches + 8,832
-#   gc.collect() calls for India alone (~45 min wasted on GC).
-#   With 3-grams at batch=1500, India runs in ~590 batches instead.
+# TFIDF_NGRAM_RANGE: (3,5) — 3-grams are sparse/discriminative vs noisy 2-grams.
+# TFIDF_MAX_FEATURES: 20_000 caps vocab, bounding the sparse matrix width.
+# TFIDF_BATCH_SIZE: 500 — safe on 30GB RAM even with full India 4.1M candidates.
+#   Peak RAM per batch ≈ 500 × 4.1M × sparsity × 8 bytes ≈ 500 MB.
+# TFIDF_SIM_THRESHOLD: 0.15 aggressively prunes non-matching pairs early,
+#   reducing both nnz in the sim matrix and candidate list size.
 TFIDF_NGRAM_RANGE = (3, 5)
-TFIDF_MIN_DF = 2             # prune rare n-grams (typo singletons)
+TFIDF_MIN_DF = 5             # prune rare n-grams; smaller, tighter vocab
 TFIDF_MAX_DF = 0.5
-TFIDF_MAX_FEATURES = 30_000  # caps vocabulary → bounds sparse matrix size
-TFIDF_BATCH_SIZE = 1500      # safe with 3-grams; 15x fewer batches vs batch=100
-TFIDF_SIM_THRESHOLD = 0.1    # drop cosine similarities below this
+TFIDF_MAX_FEATURES = 20_000  # caps vocabulary → smaller sparse matrix
+TFIDF_BATCH_SIZE = 500       # safe on 30GB Kaggle; ~1766 batches for India
+TFIDF_SIM_THRESHOLD = 0.15   # higher threshold → fewer nnz → less RAM
 
 # Training sample cap
 # LightGBM converges with 50k-100k S1 training entities (~1.5M pairwise rows).
