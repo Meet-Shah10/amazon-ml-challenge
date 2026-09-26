@@ -165,8 +165,32 @@ def run_training(s1, s2, s3, ground_truth, sample=None):
 
     # ── Stage 3: Model Training ──
     logger.info("── Stage 3: Model Training ──")
+
+    # Stratified training sample cap (config.TRAIN_SAMPLE_SIZE).
+    # Blocking runs on ALL S1 for maximum candidate recall.
+    # LightGBM training is capped: GBDT convergence plateaus at 50k-100k
+    # S1 entities (~1.5M pairwise rows). Training on 2.2M S1 generates
+    # 44M pairwise rows, wastes 20+ hours, and does not improve accuracy.
+    train_features_for_model = train_features
+    gt_for_model = gt_subset
+    train_cap = getattr(config, "TRAIN_SAMPLE_SIZE", None)
+    if train_cap and not sample:
+        all_s1_ids = train_features["source1_entity_id"].unique()
+        if len(all_s1_ids) > train_cap:
+            rng = np.random.default_rng(42)
+            sampled_ids = set(rng.choice(all_s1_ids, size=train_cap, replace=False))
+            train_features_for_model = train_features[
+                train_features["source1_entity_id"].isin(sampled_ids)
+            ].reset_index(drop=True)
+            gt_for_model = {k: v for k, v in gt_subset.items() if k in sampled_ids}
+            logger.info(
+                "  training on %d / %d S1 entities (%d pairwise rows) "
+                "[TRAIN_SAMPLE_SIZE cap]",
+                train_cap, len(all_s1_ids), len(train_features_for_model),
+            )
+
     models, calibrator, best_t, best_f05, oof_df = train_matcher(
-        train_features, gt_subset
+        train_features_for_model, gt_for_model
     )
 
     elapsed = time.time() - t0

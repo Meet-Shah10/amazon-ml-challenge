@@ -58,18 +58,27 @@ PRUNE_MIN_SCORE = 0.35       # score-floor exception for high-confidence extras
 PRUNE_HARD_CAP = 60          # absolute cap even with score-floor exception
 
 # TF-IDF vectoriser
-# TFIDF_MAX_FEATURES:  35_000 is the Kaggle-safe default (30 GB RAM limit).
-#   Raise to 50_000-100_000 if you have ≥ 16 GB free RAM.
-# TFIDF_BATCH_SIZE:   100 keeps the per-batch intermediate dense matrix
-#   at ~800 MB even for the largest partition (India: 4.1 M candidates).
-#   The previous default of 1000 caused an ~8 GB spike and OOM kill on Kaggle.
-#   Raise back to 1000 only on machines with ≥ 64 GB RAM.
-TFIDF_NGRAM_RANGE = (2, 4)
-TFIDF_MIN_DF = 3             # prune rare n-grams (typo singletons)
+# TFIDF_NGRAM_RANGE: (3,5) uses discriminative 3-grams instead of noisy 2-grams.
+#   2-grams like "in","st","co" appear in almost every business name, creating
+#   a dense similarity matrix that makes every S1 query match millions of docs.
+#   3-grams "sta","tar","buc" are truly sparse → allows a much larger batch size.
+# TFIDF_MAX_FEATURES: 30_000 is the Kaggle-safe default (30 GB RAM).
+# TFIDF_BATCH_SIZE:   1500 is safe with 3-grams (sparse matrix, ~800 MB peak).
+#   The previous batch size of 100 with 2-grams caused 8,832 batches + 8,832
+#   gc.collect() calls for India alone (~45 min wasted on GC).
+#   With 3-grams at batch=1500, India runs in ~590 batches instead.
+TFIDF_NGRAM_RANGE = (3, 5)
+TFIDF_MIN_DF = 2             # prune rare n-grams (typo singletons)
 TFIDF_MAX_DF = 0.5
-TFIDF_MAX_FEATURES = 35_000  # caps vocabulary → bounds sparse matrix size
-TFIDF_BATCH_SIZE = 100       # S1-entity batch size for sparse matmul (Kaggle-safe)
+TFIDF_MAX_FEATURES = 30_000  # caps vocabulary → bounds sparse matrix size
+TFIDF_BATCH_SIZE = 1500      # safe with 3-grams; 15x fewer batches vs batch=100
 TFIDF_SIM_THRESHOLD = 0.1    # drop cosine similarities below this
+
+# Training sample cap
+# LightGBM converges with 50k-100k S1 training entities (~1.5M pairwise rows).
+# Training on all 2.2M S1 entities wastes 20+ hours for zero accuracy gain.
+# Set to None to train on all S1 entities (not recommended on Kaggle).
+TRAIN_SAMPLE_SIZE = 75_000   # stratified S1 sample for LightGBM training
 
 # LightGBM
 LGBM_N_ESTIMATORS = 600

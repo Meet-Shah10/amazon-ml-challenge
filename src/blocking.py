@@ -175,7 +175,10 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
         all_results.extend(batch_results)
 
         del sim, batch
-        gc.collect()
+        # Note: gc.collect() deliberately omitted here — Python's reference
+        # counting frees 'sim' and 'batch' immediately on 'del'. Calling
+        # gc.collect() inside a tight loop of 500-8000 iterations wastes
+        # 0.2-0.5s per call (45+ minutes total for India) with no benefit.
 
     del s1_vecs, other_vecs
     gc.collect()
@@ -287,7 +290,6 @@ def _address_anchor_blocking(s1_df: pd.DataFrame,
 
     logger.info("    address-anchor: %d S1 × %d cand", len(s1_df), len(other_df))
 
-    idx_pin    = defaultdict(list)
     idx_pin_sn = defaultdict(list)
 
     for eid, pin, sn in zip(other_df["entity_id"].values,
@@ -297,8 +299,6 @@ def _address_anchor_blocking(s1_df: pd.DataFrame,
         sn  = str(sn).strip()
         if pin and sn:
             idx_pin_sn[(pin, sn)].append(eid)
-        if pin and len(idx_pin[pin]) < 500:
-            idx_pin[pin].append(eid)
 
     results = []
     for s1_id, pin, sn in zip(s1_df["entity_id"].values,
@@ -306,26 +306,18 @@ def _address_anchor_blocking(s1_df: pd.DataFrame,
                               s1_df["addr_street_num"].values):
         pin  = str(pin).strip()
         sn   = str(sn).strip()
-        seen = set()
 
+        # High-precision anchor: same PIN + same street number = same building.
+        # PIN-only lookup is deliberately removed: in India a single 6-digit PIN
+        # covers an entire postal zone with thousands of businesses, so PIN-only
+        # matching generates ~350M noisy candidate pairs with near-zero precision.
         if pin and sn:
             for eid in idx_pin_sn.get((pin, sn), []):
-                if eid not in seen:
-                    results.append({
-                        "source1_entity_id":  s1_id,
-                        "candidate_entity_id": eid,
-                        "addr_anchor":         1.0,
-                    })
-                    seen.add(eid)
-        if pin:
-            for eid in idx_pin.get(pin, []):
-                if eid not in seen:
-                    results.append({
-                        "source1_entity_id":  s1_id,
-                        "candidate_entity_id": eid,
-                        "addr_anchor":         0.5,
-                    })
-                    seen.add(eid)
+                results.append({
+                    "source1_entity_id":  s1_id,
+                    "candidate_entity_id": eid,
+                    "addr_anchor":         1.0,
+                })
 
     logger.info("      found %d candidate pairs", len(results))
     return pd.DataFrame(results) if results else pd.DataFrame(
