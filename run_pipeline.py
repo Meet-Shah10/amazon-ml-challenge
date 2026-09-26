@@ -328,9 +328,9 @@ def main():
         models, calibrator, threshold = None, None, None
 
     if args.mode in ("predict", "full"):
-        # Load test data
+        # Load test data — also respect --sample for quick local validation
         s1_test, s2_test, s3_test = load_data(
-            "test", force_norm=args.force_normalize
+            "test", sample=args.sample, force_norm=args.force_normalize
         )
 
         run_prediction(
