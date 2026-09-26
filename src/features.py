@@ -28,7 +28,6 @@ import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler, Levenshtein
-from rapidfuzz import process as rf_process
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize as sk_normalize
 from tqdm import tqdm
@@ -234,12 +233,19 @@ def _compute_chunk_features(chunk: pd.DataFrame,
     s1_tcnts   = _col_int(s1_rows,   "name_token_count")
     cand_tcnts = _col_int(cand_rows, "name_token_count")
 
-    # ── Vectorized batch string similarity (rapidfuzz C++ SIMD) ─────────────
-    # JaroWinkler.cdist and Levenshtein.normalized_similarity batch-compute
-    # the full array in a single C++ call with SIMD vectorization, replacing
-    # n individual Python→C function calls per metric (~15x faster per chunk).
-    name_jw_arr   = JaroWinkler.cdist(s1_names, cand_names, dtype=np.float32)
-    addr_jw_arr   = JaroWinkler.cdist(s1_addrs, cand_addrs, dtype=np.float32)
+    # ── Pre-compute string similarities as numpy arrays ───────────────────────
+    # rapidfuzz 3.x has no element-wise batch API (process.cdist is all-pairs,
+    # not paired-row). List comprehensions still beat calling inside the for-loop
+    # because numpy array creation batches the C extension calls and the inner
+    # loop body can use fast numpy index reads instead of per-call Python lookups.
+    name_jw_arr   = np.array(
+        [JaroWinkler.normalized_similarity(a, b) for a, b in zip(s1_names, cand_names)],
+        dtype=np.float32,
+    )
+    addr_jw_arr   = np.array(
+        [JaroWinkler.normalized_similarity(a, b) for a, b in zip(s1_addrs, cand_addrs)],
+        dtype=np.float32,
+    )
     name_lev_arr  = np.array(
         [Levenshtein.normalized_similarity(a, b) for a, b in zip(s1_names, cand_names)],
         dtype=np.float32,
@@ -256,6 +262,7 @@ def _compute_chunk_features(chunk: pd.DataFrame,
         [fuzz.token_sort_ratio(a, b) / 100.0 for a, b in zip(s1_names, cand_names)],
         dtype=np.float32,
     )
+
 
     features = []
     for i in range(n):
