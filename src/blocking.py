@@ -124,6 +124,11 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     del all_texts
     gc.collect()
 
+    if vocab_size == 0:
+        logger.warning("      empty vocabulary for '%s' — skipping TF-IDF blocking "
+                       "(partition too small for min_df/max_df constraints)", text_col)
+        return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", score_col])
+
     # Transform & L2-normalise (so dot product = cosine similarity)
     s1_vecs    = normalize(vectorizer.transform(s1_texts),    norm="l2")
     other_vecs = normalize(vectorizer.transform(other_texts), norm="l2")

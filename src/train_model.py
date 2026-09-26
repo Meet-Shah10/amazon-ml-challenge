@@ -131,8 +131,11 @@ def train_matcher(train_df: pd.DataFrame,
     calibrator.fit(oof_probs, active["is_match"].values)
     active["calibrated_prob"] = calibrator.predict(oof_probs)
 
-    # Tune threshold against F₀.₅
-    best_t, best_f05 = _tune_threshold(active, ground_truth)
+    # Tune threshold against F₀.₅, using ALL trained S1 IDs as singleton pool
+    # (not just GT-positive ones) so the F₀.₅ denominator is correct.
+    all_trained_s1_ids = set(active["source1_entity_id"].unique())
+    best_t, best_f05 = _tune_threshold(active, ground_truth,
+                                       all_s1_ids=all_trained_s1_ids)
     logger.info("  best threshold: %.3f  →  validation F₀.₅: %.4f", best_t, best_f05)
 
     # Feature importance
@@ -145,12 +148,19 @@ def train_matcher(train_df: pd.DataFrame,
     return models, calibrator, best_t, best_f05, active
 
 
-def _tune_threshold(oof_df: pd.DataFrame, ground_truth: dict) -> tuple:
+def _tune_threshold(oof_df: pd.DataFrame, ground_truth: dict,
+                    all_s1_ids: set = None) -> tuple:
     """
     Sweep thresholds against macro F₀.₅ on calibrated OOF predictions.
 
     Vectorized: builds prediction dicts using groupby + boolean mask
     on the full DataFrame rather than iterating per-threshold in Python.
+
+    Parameters
+    ----------
+    all_s1_ids : set
+        All S1 entity IDs in the training sample (including true singletons
+        that have no GT match). Required for a correct F₀.₅ denominator.
     """
     logger.info("  tuning threshold against F₀.₅ ...")
 
@@ -164,15 +174,21 @@ def _tune_threshold(oof_df: pd.DataFrame, ground_truth: dict) -> tuple:
         ["source1_entity_id", "calibrated_prob"], ascending=[True, False]
     )
 
-    # Unique S1 IDs in OOF (to fill singletons quickly)
-    all_gt_s1s = set(ground_truth.keys())
+    # Use all_s1_ids if provided (includes true singletons);
+    # fall back to GT-positive S1 IDs only (old behaviour) if not.
+    if all_s1_ids:
+        fill_s1s = all_s1_ids
+    else:
+        logger.warning("  _tune_threshold: all_s1_ids not provided — "
+                       "singleton entities excluded from F₀.₅ denominator")
+        fill_s1s = set(ground_truth.keys())
 
     for t in grid:
         matched_df = sorted_df[sorted_df["calibrated_prob"] >= t]
 
         # Build preds dict via groupby aggregation (faster than per-group loop)
         if matched_df.empty:
-            preds = {s1_id: set() for s1_id in all_gt_s1s}
+            preds = {s1_id: set() for s1_id in fill_s1s}
         else:
             preds = (
                 matched_df
@@ -180,7 +196,7 @@ def _tune_threshold(oof_df: pd.DataFrame, ground_truth: dict) -> tuple:
                 .apply(set)
                 .to_dict()
             )
-            for s1_id in all_gt_s1s:
+            for s1_id in fill_s1s:
                 if s1_id not in preds:
                     preds[s1_id] = set()
 

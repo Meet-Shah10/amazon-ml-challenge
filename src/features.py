@@ -264,54 +264,68 @@ def _compute_chunk_features(chunk: pd.DataFrame,
     )
 
 
-    features = []
+    # ── Vectorized feature construction (no Python per-row loop) ─────────────
+    # All arrays are already computed above; we just assemble them into columns.
+    s1_names_arr   = np.array(s1_names,   dtype=object)
+    cand_names_arr = np.array(cand_names, dtype=object)
+    s1_pins_arr    = np.array(s1_pins,    dtype=object)
+    cand_pins_arr  = np.array(cand_pins,  dtype=object)
+    s1_sns_arr     = np.array(s1_sns,     dtype=object)
+    cand_sns_arr   = np.array(cand_sns,   dtype=object)
+    s1_sfxs_arr    = np.array(s1_sfxs,   dtype=object)
+    cand_sfxs_arr  = np.array(cand_sfxs, dtype=object)
+    s1_firsts_arr  = np.array(s1_firsts, dtype=object)
+    cand_firsts_arr= np.array(cand_firsts, dtype=object)
+    s1_acros_arr   = np.array(s1_acros,  dtype=object)
+    cand_acros_arr = np.array(cand_acros, dtype=object)
+    s1_cnorms_arr  = np.array(s1_cnorms, dtype=object)
+    cand_cnorms_arr= np.array(cand_cnorms, dtype=object)
+    s1_tcnts_arr   = np.array(s1_tcnts,  dtype=np.int32)
+    cand_tcnts_arr = np.array(cand_tcnts, dtype=np.int32)
+
+    # Boolean masks for non-empty pair comparisons
+    both_names  = (s1_names_arr != "") & (cand_names_arr != "")
+    both_pins   = (s1_pins_arr  != "") & (cand_pins_arr  != "")
+    both_sns    = (s1_sns_arr   != "") & (cand_sns_arr   != "")
+    both_sfx    = (s1_sfxs_arr  != "") & (cand_sfxs_arr  != "")
+    both_first  = (s1_firsts_arr != "") & (cand_firsts_arr != "")
+    both_acro   = (s1_acros_arr != "") & (cand_acros_arr != "")
+    both_cnorm  = (s1_cnorms_arr != "") & (cand_cnorms_arr != "")
+
+    # Common token features (still needs a small loop — rapidfuzz has no batch API)
+    common_counts = np.zeros(n, dtype=np.int32)
+    common_ratios = np.zeros(n, dtype=np.float32)
     for i in range(n):
-        s1_n  = s1_names[i]
-        c_n   = cand_names[i]
-        s1_a  = s1_addrs[i]
-        c_a   = cand_addrs[i]
-        s1_p  = s1_pins[i]
-        c_p   = cand_pins[i]
-        s1_sn = s1_sns[i]
-        c_sn  = cand_sns[i]
+        c, r = _common_tokens(s1_toks[i], cand_toks[i])
+        common_counts[i] = c
+        common_ratios[i] = r
 
-        name_jw = float(name_jw_arr[i])
-        addr_jw = float(addr_jw_arr[i])
-
-        common, common_ratio = _common_tokens(s1_toks[i], cand_toks[i])
-
-        feat = {
-            # Name features
-            "name_exact":           int(s1_n == c_n and s1_n != ""),
-            "name_jw":              name_jw,
-            "name_lev":             float(name_lev_arr[i]),
-            "name_token_set":       float(name_tset_arr[i]),
-            "name_token_sort":      float(name_tsort_arr[i]),
-            "suffix_match":         int(s1_sfxs[i] == cand_sfxs[i] and s1_sfxs[i] != ""),
-            "first_token_match":    int(s1_firsts[i] == cand_firsts[i] and s1_firsts[i] != ""),
-            "acronym_match":        int(s1_acros[i] != "" and s1_acros[i] == cand_acros[i]),
-            "name_common_tokens":   common,
-            "name_common_ratio":    common_ratio,
-            "name_token_count_diff": abs(s1_tcnts[i] - cand_tcnts[i]),
-
-            # Address features
-            "addr_jw":              addr_jw,
-            "addr_lev":             float(addr_lev_arr[i]),
-            # addr_tfidf_cos added externally from bulk computation
-            "pin_match":            int(s1_p != "" and c_p != "" and s1_p == c_p),
-            "street_num_match":     int(s1_sn != "" and c_sn != "" and s1_sn == c_sn),
-
-            # Country
-            "country_match":        int(s1_cnorms[i] == cand_cnorms[i] and s1_cnorms[i] != ""),
-
-            # Chain/franchise disambiguation
-            "name_match_addr_mismatch": int(name_jw >= 0.92 and addr_jw < 0.30),
-            "pin_conflict":         int(s1_p != "" and c_p != "" and s1_p != c_p),
-            "street_num_conflict":  int(s1_sn != "" and c_sn != "" and s1_sn != c_sn),
-        }
-        features.append(feat)
-
-    return pd.DataFrame(features)
+    return pd.DataFrame({
+        # Name features
+        "name_exact":            (both_names & (s1_names_arr == cand_names_arr)).astype(np.int8),
+        "name_jw":               name_jw_arr,
+        "name_lev":              name_lev_arr,
+        "name_token_set":        name_tset_arr,
+        "name_token_sort":       name_tsort_arr,
+        "suffix_match":          (both_sfx   & (s1_sfxs_arr   == cand_sfxs_arr  )).astype(np.int8),
+        "first_token_match":     (both_first & (s1_firsts_arr == cand_firsts_arr)).astype(np.int8),
+        "acronym_match":         (both_acro  & (s1_acros_arr  == cand_acros_arr )).astype(np.int8),
+        "name_common_tokens":    common_counts,
+        "name_common_ratio":     common_ratios,
+        "name_token_count_diff": np.abs(s1_tcnts_arr - cand_tcnts_arr).astype(np.int32),
+        # Address features
+        "addr_jw":               addr_jw_arr,
+        "addr_lev":              addr_lev_arr,
+        # addr_tfidf_cos added externally from bulk computation
+        "pin_match":             (both_pins  & (s1_pins_arr  == cand_pins_arr )).astype(np.int8),
+        "street_num_match":      (both_sns   & (s1_sns_arr   == cand_sns_arr  )).astype(np.int8),
+        # Country
+        "country_match":         (both_cnorm & (s1_cnorms_arr == cand_cnorms_arr)).astype(np.int8),
+        # Chain/franchise disambiguation
+        "name_match_addr_mismatch": ((name_jw_arr >= 0.92) & (addr_jw_arr < 0.30)).astype(np.int8),
+        "pin_conflict":          (both_pins  & (s1_pins_arr  != cand_pins_arr )).astype(np.int8),
+        "street_num_conflict":   (both_sns   & (s1_sns_arr   != cand_sns_arr  )).astype(np.int8),
+    })
 
 
 def _zero_features() -> dict:
@@ -351,7 +365,10 @@ def _batch_addr_tfidf(pairs: pd.DataFrame,
 
     vectorizer = TfidfVectorizer(
         analyzer="char_wb", ngram_range=(2, 4),
-        min_df=1, max_df=1.0, dtype=np.float32,
+        min_df=3,           # prune typo/rare n-grams
+        max_df=0.10,        # prune stop-word n-grams ("road","nagar","pvt")
+        max_features=20_000, # hard cap — keeps transform fast and matrix small
+        dtype=np.float32,
     )
     vectorizer.fit(all_addrs)
 
