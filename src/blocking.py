@@ -187,94 +187,141 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     })
 
 
-# ── Strategy 3: Token inverted-index blocking ─────────────────────────────
+# ── Strategy 3: Token overlap blocking (CountVectorizer + sparse dot product) ─
 
 def _token_inverted_index_blocking(s1_df: pd.DataFrame,
                                    other_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Name-token inverted index — fast, low-memory safety net.
+    Name-token overlap blocking via CountVectorizer + batched sparse dot product.
 
-    Builds an inverted index from S2/S3 name tokens (capped by max document
-    frequency to skip ultra-common tokens).  For each S1 entity, retrieves
-    candidates sharing ≥ min_shared tokens and scores by Jaccard.
+    Replaces the Python nested-loop inverted index (millions of dict lookups)
+    with a vectorized approach:
+      1. CountVectorizer(binary=True) builds sparse binary token matrices in C++.
+      2. overlap = s1_batch.dot(other^T) gives shared-token counts via BLAS.
+      3. Filter by min_shared, extract top-K with Jaccard scoring.
+
+    Memory: sparse binary float32 for 4.1M India candidates ≈ 160 MB.
+    Speed: no Python dict loops; all token intersection work in C++ backend.
     """
     if other_df.empty or s1_df.empty:
         return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id",
                                      "token_jaccard"])
 
-    max_df     = config.TOKEN_BLOCK_MAX_DF
+    from sklearn.feature_extraction.text import CountVectorizer
+
     min_shared = config.TOKEN_BLOCK_MIN_SHARED
+    max_df_abs = config.TOKEN_BLOCK_MAX_DF
+    top_k      = config.TFIDF_TOP_K
+    batch_size = config.TFIDF_BATCH_SIZE
 
-    logger.info("    token inverted index: %d S1 × %d cand (max_df=%d, min_shared=%d)",
-                len(s1_df), len(other_df), max_df, min_shared)
+    logger.info("    token overlap (vectorized): %d S1 x %d cand "
+                "(min_shared=%d, max_df=%d)",
+                len(s1_df), len(other_df), min_shared, max_df_abs)
 
-    # Build inverted index
-    other_eids          = other_df["entity_id"].values
-    other_tokens_list   = other_df["name_tokens"].values
-    other_token_counts  = np.zeros(len(other_df), dtype=np.int32)
+    def _safe_tokens(val):
+        """Normalize to a list of tokens with min length 3."""
+        if isinstance(val, list):
+            return [t for t in val if len(t) >= 3]
+        if val and val == val:   # not NaN
+            return [t for t in str(val).split() if len(t) >= 3]
+        return []
 
-    inv_idx: defaultdict = defaultdict(list)
-    for i, tokens in enumerate(other_tokens_list):
-        if not isinstance(tokens, list):
-            tokens = str(tokens).split() if tokens else []
-        # Filter: min length 3 removes single digits, "of", "at", "st",
-        # "rd", "nr" etc. that appear in almost every record and create
-        # near-Cartesian joins without any discriminative value.
-        unique = {t for t in tokens if len(t) >= 3}
-        other_token_counts[i] = len(unique)
-        for t in unique:
-            inv_idx[t].append(i)
+    s1_toks  = [_safe_tokens(v) for v in s1_df["name_tokens"].values]
+    oth_toks = [_safe_tokens(v) for v in other_df["name_tokens"].values]
 
-    # Prune high-frequency tokens
-    pruned_count = 0
-    filtered_idx = {}
-    for t, posting in inv_idx.items():
-        if len(posting) <= max_df:
-            filtered_idx[t] = posting
-        else:
-            pruned_count += 1
-    del inv_idx
-    gc.collect()
-    logger.info("      index: %d tokens kept, %d pruned (freq > %d)",
-                len(filtered_idx), pruned_count, max_df)
-
-    results  = []
-    s1_eids  = s1_df["entity_id"].values
-    s1_tokens_list = s1_df["name_tokens"].values
-
-    for s1_i in range(len(s1_df)):
-        s1_id     = s1_eids[s1_i]
-        s1_tokens = s1_tokens_list[s1_i]
-        if not isinstance(s1_tokens, list):
-            s1_tokens = str(s1_tokens).split() if s1_tokens else []
-        s1_set = set(s1_tokens)
-        if not s1_set:
-            continue
-        s1_n = len(s1_set)
-
-        cand_shared: defaultdict = defaultdict(int)
-        for t in s1_set:
-            for cand_i in filtered_idx.get(t, []):
-                cand_shared[cand_i] += 1
-
-        for cand_i, shared in cand_shared.items():
-            if shared < min_shared:
-                continue
-            cand_n = int(other_token_counts[cand_i])
-            union  = s1_n + cand_n - shared
-            jaccard = shared / union if union > 0 else 0.0
-            results.append({
-                "source1_entity_id":  s1_id,
-                "candidate_entity_id": other_eids[cand_i],
-                "token_jaccard":       jaccard,
-            })
-
-    del filtered_idx
-    gc.collect()
-    logger.info("      found %d candidate pairs", len(results))
-    return pd.DataFrame(results) if results else pd.DataFrame(
-        columns=["source1_entity_id", "candidate_entity_id", "token_jaccard"]
+    # CountVectorizer: binary=True -> values in {0,1}, float32 saves RAM.
+    # analyzer=lambda x: x passes pre-tokenised lists directly (no re-splitting).
+    # max_df=int -> absolute document frequency cap (same as TOKEN_BLOCK_MAX_DF).
+    cv = CountVectorizer(
+        analyzer=lambda x: x,
+        binary=True,
+        min_df=2,
+        max_df=max_df_abs,
+        dtype=np.float32,
     )
+    cv.fit(s1_toks + oth_toks)
+    logger.info("      vocabulary size: %d tokens", len(cv.vocabulary_))
+
+    s1_mat  = cv.transform(s1_toks)   # (n_s1,   vocab) sparse float32
+    oth_mat = cv.transform(oth_toks)  # (n_other, vocab) sparse float32
+
+    # Token counts per entity: row sums of binary matrix.
+    # Needed for Jaccard denominator: union = s1_n + other_n - shared.
+    s1_counts  = np.asarray(s1_mat.sum(axis=1)).ravel().astype(np.float32)
+    oth_counts = np.asarray(oth_mat.sum(axis=1)).ravel().astype(np.float32)
+
+    del cv, s1_toks, oth_toks
+    gc.collect()
+
+    s1_ids  = s1_df["entity_id"].values
+    oth_ids = other_df["entity_id"].values
+    n_s1    = len(s1_df)
+    n_batches = (n_s1 + batch_size - 1) // batch_size
+
+    out_s1:     list = []
+    out_cand:   list = []
+    out_scores: list = []
+
+    for b in tqdm(range(n_batches), desc="      token-cv", leave=False):
+        start = b * batch_size
+        end   = min(start + batch_size, n_s1)
+        batch = s1_mat[start:end]
+
+        # Sparse dot: overlap[i,j] = shared token count (all in C++ BLAS)
+        overlap = batch.dot(oth_mat.T).tocsr()
+
+        # Prune pairs below min_shared threshold
+        if overlap.nnz > 0 and min_shared > 0:
+            overlap.data[overlap.data < min_shared] = 0
+            overlap.eliminate_zeros()
+
+        # Extract top-K pairs with Jaccard scoring via flat parallel lists
+        indptr  = overlap.indptr
+        indices = overlap.indices
+        data    = overlap.data
+
+        for i in range(overlap.shape[0]):
+            sp = indptr[i]; ep = indptr[i + 1]
+            if sp == ep:
+                continue
+            row_data = data[sp:ep]
+            row_idx  = indices[sp:ep]
+            s1_id    = s1_ids[start + i]
+            s1_n     = s1_counts[start + i]
+            n        = len(row_data)
+
+            if n <= top_k:
+                for ki in range(n):
+                    j      = row_idx[ki]
+                    shared = row_data[ki]
+                    union_ = s1_n + oth_counts[j] - shared
+                    out_s1.append(s1_id)
+                    out_cand.append(oth_ids[j])
+                    out_scores.append(float(shared / union_) if union_ > 0 else 0.0)
+            else:
+                top_local = np.argpartition(row_data, -top_k)[-top_k:]
+                for ki in top_local:
+                    j      = row_idx[ki]
+                    shared = row_data[ki]
+                    union_ = s1_n + oth_counts[j] - shared
+                    out_s1.append(s1_id)
+                    out_cand.append(oth_ids[j])
+                    out_scores.append(float(shared / union_) if union_ > 0 else 0.0)
+
+        del overlap, batch
+
+    del s1_mat, oth_mat
+    gc.collect()
+
+    logger.info("      found %d candidate pairs", len(out_s1))
+    if not out_s1:
+        return pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id",
+                                     "token_jaccard"])
+    return pd.DataFrame({
+        "source1_entity_id":  out_s1,
+        "candidate_entity_id": out_cand,
+        "token_jaccard":      out_scores,
+    })
 
 
 # ── Strategy 4: Address-anchor blocking ───────────────────────────────────

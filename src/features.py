@@ -119,25 +119,50 @@ def compute_features(pairs_df: pd.DataFrame,
     s1_lookup    = s1_df.set_index("entity_id")
     s2s3_lookup  = s2s3_df.set_index("entity_id")
 
-    # Pre-compute address TF-IDF cosine similarity in bulk
+    # Pre-compute address TF-IDF cosine similarity in bulk (104 MB for 26M pairs)
     addr_tfidf_cos = _batch_addr_tfidf(active, s1_lookup, s2s3_lookup)
 
-    # Compute features in chunks to show progress
-    n_chunks    = max(1, (len(active) + batch_size - 1) // batch_size)
-    all_features = []
+    # Stream feature chunks directly to parquet instead of accumulating in RAM.
+    # Accumulating 26M rows × 30 cols as DataFrames peaks at ~8 GB before
+    # pd.concat. Streaming keeps peak RAM at ~100 MB (one chunk at a time).
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import os as _os
+
+    feat_stream_path = _os.path.join(config.CACHE_DIR, "_feat_stream_tmp.parquet")
+    pq_writer = None
+
+    n_chunks = max(1, (len(active) + batch_size - 1) // batch_size)
 
     for chunk_idx in tqdm(range(n_chunks), desc="  features", leave=False):
         start = chunk_idx * batch_size
         end   = min(start + batch_size, len(active))
         chunk = active.iloc[start:end]
 
-        features = _compute_chunk_features(chunk, s1_lookup, s2s3_lookup)
-        all_features.append(features)
+        feat_chunk = _compute_chunk_features(chunk, s1_lookup, s2s3_lookup)
+        feat_chunk["addr_tfidf_cos"] = addr_tfidf_cos[start:end]
 
-    features_df = pd.concat(all_features, ignore_index=True)
+        table = pa.Table.from_pandas(feat_chunk, preserve_index=False)
+        if pq_writer is None:
+            pq_writer = pq.ParquetWriter(feat_stream_path, table.schema,
+                                         compression="snappy")
+        pq_writer.write_table(table)
+        del feat_chunk, table
 
-    # Add address TF-IDF cosine
-    features_df["addr_tfidf_cos"] = addr_tfidf_cos
+    if pq_writer:
+        pq_writer.close()
+
+    del addr_tfidf_cos
+    gc.collect()
+
+    # Load back from parquet — at this point blocking memory is fully freed
+    # so we have headroom. is_reciprocal_nn needs the full DataFrame to compute
+    # the cross-candidate merge, so it runs after the full load.
+    features_df = pd.read_parquet(feat_stream_path)
+    try:
+        _os.unlink(feat_stream_path)
+    except OSError:
+        pass
 
     # Compute reciprocal-NN indicator (vectorized, no Python loop)
     features_df["is_reciprocal_nn"] = _reciprocal_nn(features_df)
@@ -147,11 +172,15 @@ def compute_features(pairs_df: pd.DataFrame,
         if col not in active.columns:
             active[col] = features_df[col].values
 
+    del features_df
+    gc.collect()
+
     # Recombine with empty rows (empty rows get NaN features)
     result = pd.concat([active, empty], ignore_index=True)
 
     logger.info("=== FEATURES DONE: %d columns ===", len(config.FEATURE_COLS))
     return result
+
 
 
 def _compute_chunk_features(chunk: pd.DataFrame,
