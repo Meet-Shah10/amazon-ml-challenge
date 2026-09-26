@@ -217,7 +217,10 @@ def _token_inverted_index_blocking(s1_df: pd.DataFrame,
     for i, tokens in enumerate(other_tokens_list):
         if not isinstance(tokens, list):
             tokens = str(tokens).split() if tokens else []
-        unique = set(tokens)
+        # Filter: min length 3 removes single digits, "of", "at", "st",
+        # "rd", "nr" etc. that appear in almost every record and create
+        # near-Cartesian joins without any discriminative value.
+        unique = {t for t in tokens if len(t) >= 3}
         other_token_counts[i] = len(unique)
         for t in unique:
             inv_idx[t].append(i)
