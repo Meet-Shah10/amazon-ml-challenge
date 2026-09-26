@@ -52,6 +52,18 @@ TOKEN_BLOCK_MAX_DF = 3000    # inverted-index: skip tokens in >N docs
 TOKEN_BLOCK_MIN_SHARED = 2   # min shared tokens to keep a candidate
 ADDR_ANCHOR_ENABLED = True   # address-anchor blocking on/off
 
+# Address TF-IDF blocking toggle.
+# DISABLED: address char n-grams create extremely dense matrices.
+# India addr_norm: 4.1M docs → nnz=423M, ~3.4 GB (vs name nnz=140M, ~1.1 GB).
+# Root cause: tokens like "road","nagar","street","mumbai","delhi" overlap
+# across almost every record → near-dense similarity matrix → OOM.
+# Address similarity is still captured as a FEATURE (addr_tfidf_cos) in
+# features.py via element-wise cosine on unique address pairs.
+# Recall impact: minimal — true matches are caught by name TF-IDF + token
+# overlap; renamed businesses are caught by address anchor (PIN+street_num).
+# Enable only on machines with ≥ 40 GB free RAM.
+ADDR_TFIDF_ENABLED = False
+
 # Pruning
 PRUNE_TOP_K = 12             # hard top-K per S1 entity after union
 PRUNE_MIN_SCORE = 0.40       # score-floor exception for high-confidence extras

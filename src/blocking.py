@@ -482,19 +482,24 @@ def _block_partition(s1_part: pd.DataFrame, s2_part: pd.DataFrame,
         frames.append(name_df)
     gc.collect()
 
-    # 2. TF-IDF on address (catches DBA / renamed businesses)
-    addr_df = _tfidf_blocking(s1_part, other, "addr_norm", top_k, "addr_sim")
-    if not addr_df.empty:
-        frames.append(addr_df)
-    gc.collect()
+    # 2. TF-IDF on address — DISABLED by default (ADDR_TFIDF_ENABLED=False).
+    # Address char n-grams produce 3× denser matrices than name (423M vs 140M
+    # nnz for India), causing OOM on 30 GB machines and adding minimal recall:
+    # true matches are name-similar; renamed businesses caught by addr anchor.
+    # Enable on machines with ≥ 40 GB free RAM.
+    if getattr(config, "ADDR_TFIDF_ENABLED", False):
+        addr_df = _tfidf_blocking(s1_part, other, "addr_norm", top_k, "addr_sim")
+        if not addr_df.empty:
+            frames.append(addr_df)
+        gc.collect()
 
-    # 3. Token inverted index on name (fast exact-token safety net)
+    # 3. Token overlap blocking (CountVectorizer + sparse dot product)
     tok_df = _token_inverted_index_blocking(s1_part, other)
     if not tok_df.empty:
         frames.append(tok_df)
     gc.collect()
 
-    # 4. Address-anchor blocking
+    # 4. Address-anchor blocking (PIN + street_num exact match)
     if config.ADDR_ANCHOR_ENABLED:
         anchor_df = _address_anchor_blocking(s1_part, other)
         if not anchor_df.empty:
