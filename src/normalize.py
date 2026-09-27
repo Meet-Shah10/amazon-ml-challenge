@@ -11,6 +11,7 @@ All scalar functions remain for use in unit tests or debugging.
 import os
 import re
 import logging
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -261,7 +262,7 @@ def load_and_normalize(tsv_path: str, force: bool = False) -> pd.DataFrame:
     return df
 
 
-def load_ground_truth(path: str | None = None) -> dict:
+def load_ground_truth(path: Optional[str] = None) -> dict:
     """
     Load ground truth into a dict mapping source1_entity_id → set of matched ids.
 
