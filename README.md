@@ -2,16 +2,22 @@
 
 ## Quick Start
 
+**Python version: 3.9+** (tested on 3.9 and 3.11)
+
 ```bash
 cd student_resource/code/business_entity_resolution
 
-# Install dependencies
+# Install dependencies (CPU-only)
 pip install -r requirements.txt
+
+# Install GPU acceleration for Kaggle (optional but recommended)
+pip install cupy-cuda12x   # or cupy-cuda11x depending on CUDA driver
 
 # Quick validation run (small sample — ~10 min)
 python run_pipeline.py --mode train --sample 10000
 
 # Full training + prediction (produces both output TSVs)
+# Expected runtime: ~1 hr 15 min on Kaggle GPU T4 x2
 python run_pipeline.py --mode full
 
 # Training only (creates models in models/)
@@ -20,6 +26,12 @@ python run_pipeline.py --mode train
 # Prediction only (loads trained models, writes output/)
 python run_pipeline.py --mode predict
 ```
+
+### Running on Kaggle
+1. Set **Accelerator = GPU T4 x2** in the right-hand sidebar.
+2. Set **Internet = ON** in the right-hand sidebar.
+3. Run the full pipeline with `!python run_pipeline.py --mode full`.
+
 
 ## Architecture
 
