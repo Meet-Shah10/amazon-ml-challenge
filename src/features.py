@@ -127,26 +127,39 @@ def compute_features(pairs_df: pd.DataFrame,
     import pyarrow as pa
     import pyarrow.parquet as pq
     import os as _os
+    from concurrent.futures import ThreadPoolExecutor
 
     feat_stream_path = _os.path.join(config.CACHE_DIR, "_feat_stream_tmp.parquet")
     pq_writer = None
 
     n_chunks = max(1, (len(active) + batch_size - 1) // batch_size)
+    n_workers = getattr(config, "N_CPU_WORKERS", 1)
 
-    for chunk_idx in tqdm(range(n_chunks), desc="  features", leave=False):
+    def _process_chunk_to_table(chunk_idx: int) -> pa.Table:
         start = chunk_idx * batch_size
         end   = min(start + batch_size, len(active))
         chunk = active.iloc[start:end]
-
         feat_chunk = _compute_chunk_features(chunk, s1_lookup, s2s3_lookup)
         feat_chunk["addr_tfidf_cos"] = addr_tfidf_cos[start:end]
+        return pa.Table.from_pandas(feat_chunk, preserve_index=False)
 
-        table = pa.Table.from_pandas(feat_chunk, preserve_index=False)
-        if pq_writer is None:
-            pq_writer = pq.ParquetWriter(feat_stream_path, table.schema,
-                                         compression="snappy")
-        pq_writer.write_table(table)
-        del feat_chunk, table
+    if n_workers > 1 and n_chunks > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            for table in tqdm(executor.map(_process_chunk_to_table, range(n_chunks)),
+                              total=n_chunks, desc=f"  features ({n_workers} threads)", leave=False):
+                if pq_writer is None:
+                    pq_writer = pq.ParquetWriter(feat_stream_path, table.schema,
+                                                 compression="snappy")
+                pq_writer.write_table(table)
+                del table
+    else:
+        for chunk_idx in tqdm(range(n_chunks), desc="  features", leave=False):
+            table = _process_chunk_to_table(chunk_idx)
+            if pq_writer is None:
+                pq_writer = pq.ParquetWriter(feat_stream_path, table.schema,
+                                             compression="snappy")
+            pq_writer.write_table(table)
+            del table
 
     if pq_writer:
         pq_writer.close()
@@ -376,7 +389,24 @@ def _batch_addr_tfidf(pairs: pd.DataFrame,
     cand_vecs = sk_normalize(vectorizer.transform(cand_addrs), norm="l2")
 
     # Element-wise dot product of L2-normalised vectors = cosine similarity
-    cosines = np.asarray(s1_vecs.multiply(cand_vecs).sum(axis=1)).flatten()
+    cosines = None
+    if getattr(config, "USE_GPU", False):
+        try:
+            import cupy as cp
+            from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+            s1_gpu = cp_csr_matrix(s1_vecs)
+            cand_gpu = cp_csr_matrix(cand_vecs)
+            cos_gpu = s1_gpu.multiply(cand_gpu).sum(axis=1)
+            cosines = cp.asnumpy(cos_gpu).flatten()
+            del s1_gpu, cand_gpu, cos_gpu
+            cp.get_default_memory_pool().free_all_blocks()
+            logger.info("  [GPU] Computed address TF-IDF cosine on GPU via CuPy")
+        except Exception as e:
+            logger.debug("GPU cosine computation fallback to CPU: %s", e)
+            cosines = None
+
+    if cosines is None:
+        cosines = np.asarray(s1_vecs.multiply(cand_vecs).sum(axis=1)).flatten()
 
     del vectorizer, s1_vecs, cand_vecs
     gc.collect()

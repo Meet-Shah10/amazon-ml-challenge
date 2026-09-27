@@ -69,20 +69,36 @@ PRUNE_TOP_K = 12             # hard top-K per S1 entity after union
 PRUNE_MIN_SCORE = 0.40       # score-floor exception for high-confidence extras
 PRUNE_HARD_CAP = 25          # absolute cap even with score-floor exception
 
+# ── Hardware & GPU Acceleration ───────────────────────────────────────────
+def _detect_gpu() -> bool:
+    """Auto-detect if a CUDA GPU is accessible."""
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        pass
+    return False
+
+# Master GPU switch: auto-detected, or overridden via env var USE_GPU=1 / USE_GPU=0
+USE_GPU = os.environ.get("USE_GPU", "").lower() in ("1", "true") if os.environ.get("USE_GPU") else _detect_gpu()
+GPU_DEVICE_ID = 0
+
+# Multi-threading worker count for CPU-bound feature extraction
+N_CPU_WORKERS = max(1, os.cpu_count() or 4)
+
 # TF-IDF vectoriser
 # TFIDF_MAX_DF: 0.02 (2% of docs) prunes ubiquitous n-grams like "ltd", "pvt", "ind".
 #   These stop-word n-grams match millions of businesses, contributing negligible
 #   cosine score but causing 90% of the matmul computation and intermediate memory.
 #   Benchmark on real dataset: 3.1x faster matmul (2.56s -> 0.83s), 4x lower RAM,
 #   with 80.26% ground-truth recall (vs 80.86% unconstrained, only 0.6% recall loss).
-# TFIDF_BATCH_SIZE: 500 rows per batch ensures peak intermediate CSR memory
-#   stays under ~750 MB per batch against India's 4.1M candidates (100% safe on 30 GB).
+# TFIDF_BATCH_SIZE: 2500 on GPU for high tensor throughput; 500 on CPU (keeps RAM <= 750MB).
 # TFIDF_SIM_THRESHOLD: 0.25 prunes low-similarity pairs immediately, keeping output sparse.
 TFIDF_NGRAM_RANGE = (3, 5)
 TFIDF_MIN_DF = 5             # prune rare n-grams
 TFIDF_MAX_DF = 0.02          # prune ubiquitous n-grams (>2% of docs) -> 3x faster matmul, 4x less RAM
 TFIDF_MAX_FEATURES = 15_000  # tighter vocab -> faster transform + smaller matrix
-TFIDF_BATCH_SIZE = 500       # 500 rows = ~750 MB peak RAM per batch (100% OOM safe)
+TFIDF_BATCH_SIZE = 2500 if USE_GPU else 500
 TFIDF_SIM_THRESHOLD = 0.25   # high recall (80.26%), eliminates 99.9% of pairs early
 
 # Training sample cap

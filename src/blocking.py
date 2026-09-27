@@ -155,18 +155,45 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
     out_cand: list   = []
     out_scores: list = []
 
+    # GPU acceleration via CuPy (if CUDA and CuPy are available)
+    use_gpu_matmul = False
+    other_vecs_gpu = None
+    if getattr(config, "USE_GPU", False):
+        try:
+            import cupy as cp
+            from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+            other_vecs_gpu = cp_csr_matrix(other_vecs.T)
+            use_gpu_matmul = True
+            logger.info("      [GPU] Accelerated sparse matmul active via CuPy (device=0)")
+        except Exception as e:
+            logger.debug("CuPy GPU acceleration not active: %s", e)
+            use_gpu_matmul = False
+
     for b in tqdm(range(n_batches), desc=f"      tfidf-{text_col}", leave=False):
         start = b * batch_size
         end   = min(start + batch_size, n_s1)
         batch = s1_vecs[start:end]
 
-        # Sparse × sparse^T → sparse cosine-similarity matrix
-        sim = batch.dot(other_vecs.T).tocsr()
+        sim = None
+        if use_gpu_matmul:
+            try:
+                batch_gpu = cp_csr_matrix(batch)
+                sim_gpu   = batch_gpu.dot(other_vecs_gpu)
+                if threshold > 0 and sim_gpu.nnz > 0:
+                    sim_gpu.data[sim_gpu.data < threshold] = 0
+                    sim_gpu.eliminate_zeros()
+                sim = sim_gpu.get()
+                del batch_gpu, sim_gpu
+            except Exception as e:
+                logger.warning("      [GPU Fallback] Batch %d failed on GPU (%s); using CPU", b, e)
+                sim = None
 
-        # Threshold in-place to free non-zero memory quickly
-        if threshold > 0 and sim.nnz > 0:
-            sim.data[sim.data < threshold] = 0
-            sim.eliminate_zeros()
+        if sim is None:
+            # Sparse × sparse^T → sparse cosine-similarity matrix
+            sim = batch.dot(other_vecs.T).tocsr()
+            if threshold > 0 and sim.nnz > 0:
+                sim.data[sim.data < threshold] = 0
+                sim.eliminate_zeros()
 
         _sparse_top_k_rows(
             sim, start, s1_ids, other_ids, top_k,
@@ -174,8 +201,14 @@ def _tfidf_blocking(s1_df: pd.DataFrame, other_df: pd.DataFrame,
         )
 
         del sim, batch
-        # gc.collect() omitted: Python ref-counting frees sim/batch immediately.
-        # Calling gc.collect() inside a tight loop wastes 0.2-0.5s per call.
+
+    if other_vecs_gpu is not None:
+        del other_vecs_gpu
+        try:
+            import cupy as cp
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
     del s1_vecs, other_vecs
     gc.collect()
@@ -267,18 +300,45 @@ def _token_inverted_index_blocking(s1_df: pd.DataFrame,
     out_cand:   list = []
     out_scores: list = []
 
+    # GPU acceleration via CuPy (if CUDA and CuPy are available)
+    use_gpu_tok = False
+    oth_mat_gpu = None
+    if getattr(config, "USE_GPU", False):
+        try:
+            import cupy as cp
+            from cupyx.scipy.sparse import csr_matrix as cp_csr_matrix
+            oth_mat_gpu = cp_csr_matrix(oth_mat.T)
+            use_gpu_tok = True
+            logger.info("      [GPU] Accelerated token overlap dot product active via CuPy (device=0)")
+        except Exception as e:
+            logger.debug("CuPy GPU acceleration not active for token index: %s", e)
+            use_gpu_tok = False
+
     for b in tqdm(range(n_batches), desc="      token-cv", leave=False):
         start = b * batch_size
         end   = min(start + batch_size, n_s1)
         batch = s1_mat[start:end]
 
-        # Sparse dot: overlap[i,j] = shared token count (all in C++ BLAS)
-        overlap = batch.dot(oth_mat.T).tocsr()
+        overlap = None
+        if use_gpu_tok:
+            try:
+                batch_gpu   = cp_csr_matrix(batch)
+                overlap_gpu = batch_gpu.dot(oth_mat_gpu)
+                if overlap_gpu.nnz > 0 and min_shared > 0:
+                    overlap_gpu.data[overlap_gpu.data < min_shared] = 0
+                    overlap_gpu.eliminate_zeros()
+                overlap = overlap_gpu.get()
+                del batch_gpu, overlap_gpu
+            except Exception as e:
+                logger.warning("      [GPU Fallback] Token batch %d failed on GPU (%s); using CPU", b, e)
+                overlap = None
 
-        # Prune pairs below min_shared threshold
-        if overlap.nnz > 0 and min_shared > 0:
-            overlap.data[overlap.data < min_shared] = 0
-            overlap.eliminate_zeros()
+        if overlap is None:
+            # Sparse dot: overlap[i,j] = shared token count (all in C++ BLAS)
+            overlap = batch.dot(oth_mat.T).tocsr()
+            if overlap.nnz > 0 and min_shared > 0:
+                overlap.data[overlap.data < min_shared] = 0
+                overlap.eliminate_zeros()
 
         # Extract top-K pairs with Jaccard scoring via flat parallel lists
         indptr  = overlap.indptr
@@ -314,6 +374,14 @@ def _token_inverted_index_blocking(s1_df: pd.DataFrame,
                     out_scores.append(float(shared / union_) if union_ > 0 else 0.0)
 
         del overlap, batch
+
+    if oth_mat_gpu is not None:
+        del oth_mat_gpu
+        try:
+            import cupy as cp
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
 
     del s1_mat, oth_mat
     gc.collect()

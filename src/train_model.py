@@ -26,6 +26,39 @@ from .evaluate import macro_f_half
 logger = logging.getLogger(__name__)
 
 
+def _get_lgb_device_params() -> dict:
+    """
+    Detect whether LightGBM can use GPU (CUDA or OpenCL) and return appropriate parameters.
+    Falls back safely to CPU if GPU is unavailable or unsupported in the current LightGBM build.
+    """
+    if not getattr(config, "USE_GPU", False):
+        return {"device": "cpu"}
+
+    X_dummy = np.random.randn(20, 4).astype(np.float32)
+    y_dummy = np.array([0, 1] * 10, dtype=np.int32)
+
+    # 1. Try CUDA device (LightGBM >= 4.0 CUDA backend)
+    try:
+        clf = lgb.LGBMClassifier(device="cuda", n_estimators=2, verbose=-1, min_child_samples=2)
+        clf.fit(X_dummy, y_dummy)
+        logger.info("  [GPU] LightGBM CUDA acceleration verified and active (device='cuda')")
+        return {"device": "cuda"}
+    except Exception as e:
+        logger.debug("LightGBM CUDA probe failed: %s", e)
+
+    # 2. Try OpenCL GPU device
+    try:
+        clf = lgb.LGBMClassifier(device="gpu", n_estimators=2, verbose=-1, min_child_samples=2)
+        clf.fit(X_dummy, y_dummy)
+        logger.info("  [GPU] LightGBM OpenCL acceleration verified and active (device='gpu')")
+        return {"device": "gpu"}
+    except Exception as e:
+        logger.debug("LightGBM OpenCL probe failed: %s", e)
+
+    logger.info("  [CPU] LightGBM GPU build not detected; training on multi-core CPU (n_jobs=-1)")
+    return {"device": "cpu"}
+
+
 def train_matcher(train_df: pd.DataFrame,
                   ground_truth: dict) -> tuple:
     """
@@ -45,6 +78,9 @@ def train_matcher(train_df: pd.DataFrame,
               best_threshold: float, best_f05: float, oof_df: DataFrame)
     """
     logger.info("=== MODEL TRAINING ===")
+
+    # Probe and set GPU/CPU device
+    device_params = _get_lgb_device_params()
 
     # Filter to active pairs only (non-empty candidates)
     active = train_df[train_df["candidate_entity_id"] != ""].copy()
@@ -107,12 +143,24 @@ def train_matcher(train_df: pd.DataFrame,
             objective="binary",
             verbose=-1,
             n_jobs=-1,
+            **device_params,
         )
 
-        model.fit(
-            tr[features], tr["is_match"],
-            sample_weight=weights,
-        )
+        try:
+            model.fit(
+                tr[features], tr["is_match"],
+                sample_weight=weights,
+            )
+        except Exception as e:
+            if device_params.get("device") != "cpu":
+                logger.warning("    [GPU Fallback] Fold %d fit failed on GPU (%s); retrying on CPU", fold + 1, e)
+                model.set_params(device="cpu")
+                model.fit(
+                    tr[features], tr["is_match"],
+                    sample_weight=weights,
+                )
+            else:
+                raise
 
         fold_probs      = model.predict_proba(val[features])[:, 1]
         oof_probs[val_idx] = fold_probs
