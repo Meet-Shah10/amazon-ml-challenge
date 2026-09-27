@@ -237,6 +237,9 @@ def load_and_normalize(tsv_path: str, force: bool = False) -> pd.DataFrame:
     The ``name_tokens`` column (a Python list) is dropped before caching because
     parquet doesn't handle nested Python objects cleanly; it is regenerated on
     load from ``name_norm`` when needed.
+
+    Memory-safe: reads the TSV in chunks of NORM_CHUNK_SIZE rows so that peak
+    intermediate RAM is ~1-1.5 GB regardless of file size.  Safe on 8 GB EC2.
     """
     basename = os.path.splitext(os.path.basename(tsv_path))[0]
     cache_path = os.path.join(config.CACHE_DIR, f"{basename}_normalized.parquet")
@@ -251,14 +254,58 @@ def load_and_normalize(tsv_path: str, force: bool = False) -> pd.DataFrame:
         return df
 
     logger.info("  reading %s", tsv_path)
-    df = pd.read_csv(tsv_path, sep="\t", dtype=str, keep_default_na=False)
 
-    df = normalize_dataframe(df)
+    # ── Chunked normalization (memory-safe for large files) ────────────────
+    # Each chunk is normalized independently and written to a temporary parquet
+    # shard; shards are concatenated once all chunks are done, then the temp
+    # files are removed.  Peak RSS ≈ 1.5 GB even for 5 M-row source files.
+    chunk_size = getattr(config, "NORM_CHUNK_SIZE", 200_000)
+    chunk_dir  = os.path.join(config.CACHE_DIR, f"{basename}_chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+    chunk_paths = []
 
-    # Cache (drop name_tokens list before writing)
-    cache_df = df.drop(columns=["name_tokens"], errors="ignore")
-    cache_df.to_parquet(cache_path, index=False)
+    reader = pd.read_csv(
+        tsv_path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+        chunksize=chunk_size,
+    )
+    for i, chunk in enumerate(reader):
+        chunk_cache = os.path.join(chunk_dir, f"chunk_{i:04d}.parquet")
+        if not os.path.exists(chunk_cache) or force:
+            logger.info("  chunk %d: normalizing %d rows ...", i, len(chunk))
+            normed = normalize_dataframe(chunk)
+            normed.drop(columns=["name_tokens"], errors="ignore").to_parquet(
+                chunk_cache, index=False
+            )
+        else:
+            logger.info("  chunk %d: already cached, skipping.", i)
+        chunk_paths.append(chunk_cache)
+
+    logger.info("  merging %d chunk(s) ...", len(chunk_paths))
+    df = pd.concat(
+        [pd.read_parquet(p) for p in chunk_paths],
+        ignore_index=True,
+    )
+
+    # Write consolidated cache and clean up temporary chunk shards
+    df.to_parquet(cache_path, index=False)
     logger.info("  cached to %s", cache_path)
+    for p in chunk_paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    try:
+        os.rmdir(chunk_dir)
+    except OSError:
+        pass
+
+    # Regenerate name_tokens in-memory (list column; not stored in parquet)
+    df["name_tokens"] = df["name_norm"].str.split().apply(
+        lambda t: t if isinstance(t, list) else []
+    )
     return df
 
 

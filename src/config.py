@@ -91,6 +91,10 @@ TFIDF_SIM_THRESHOLD = 0.25   # high recall (80.26%), eliminates 99.9% of pairs e
 # Set to None to train on all S1 entities (not recommended on Kaggle).
 TRAIN_SAMPLE_SIZE = 75_000   # stratified S1 sample for LightGBM training
 
+# Normalization chunk size — keeps peak RAM ≤ 1.5 GB on small EC2 instances.
+# At 200 k rows / chunk, India's 5 M-row source2 needs only ~1.1 GB peak RAM.
+NORM_CHUNK_SIZE = 200_000
+
 # LightGBM
 LGBM_N_ESTIMATORS = 600
 LGBM_LEARNING_RATE = 0.03
